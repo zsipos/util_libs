@@ -13,6 +13,7 @@
 #pragma once
 
 #include <utils/util.h>
+#include <platsupport/io.h>
 
 #define PS_DRIVER_MODULE_DEFINE(name, compat_list, init_func)                   \
     static_assert(compat_list != NULL, "Supplied compatible_list is NULL!");    \
@@ -32,9 +33,9 @@
  *  - PS_DRIVER_INIT_SUCCESS on success
  *  - PS_DRIVER_INIT_DEFER when you want to defer this initialisation function until later
  */
-typedef int (*ps_driver_init_fn_t)(ps_io_ops_t *io_ops, char *device_path);
+typedef int (*ps_driver_init_fn_t)(ps_io_ops_t *io_ops, const char *device_path);
 
 typedef struct {
-    char **compatible_list;
+    const char **compatible_list;
     ps_driver_init_fn_t init;
 } ps_driver_module_t;

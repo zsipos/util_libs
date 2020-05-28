@@ -172,7 +172,7 @@ struct eqos_dma_regs {
     uint32_t ch0_rxdesc_tail_pointer;       /* 0x1128 */
     uint32_t ch0_txdesc_ring_length;        /* 0x112c */
     uint32_t ch0_rxdesc_ring_length;        /* 0x1130 */
-    uint32_t rx_dma;                        /* 0x1134 */
+    uint32_t ch0_dma_ie;                    /* 0x1134 */
 };
 
 #define EQOS_DMA_MODE_SWR               BIT(0)
@@ -250,12 +250,15 @@ struct eqos_priv {
     struct clock *clk_slave_bus;
     struct mii_dev *mii;
     struct phy_device *phy;
+    uintptr_t last_rx_desc;
+    uintptr_t last_tx_desc;
     unsigned char enetaddr[ARP_HLEN];
     bool reg_access_ok;
     ps_io_ops_t *tx2_io_ops;
-    gpio_sys_t gpio_sys;
+    gpio_sys_t *gpio_sys;
     gpio_t gpio;
-    reset_sys_t reset_sys;
+    reset_sys_t *reset_sys;
+    clock_sys_t *clock_sys;
 };
 
 #define REG_DWCEQOS_DMA_CH0_STA          0x1160
@@ -296,13 +299,14 @@ struct eqos_priv {
 #define DWCEQOS_MAC_CFG_IPC              BIT(27)
 #define DWCEQOS_MAC_CFG_RE               BIT(0)
 
-static void dwceqos_dma_disable_rxirq(struct eqos_priv *eqos)
+void eqos_dma_disable_rxirq(struct tx2_eth_data *dev)
 {
+    struct eqos_priv *eqos = (struct eqos_priv *)dev->eth_dev;
     uint32_t regval;
 
-    regval = eqos->dma_regs->rx_dma;
+    regval = eqos->dma_regs->ch0_dma_ie;
     regval &= ~DWCEQOS_DMA_CH0_IE_RIE;
-    eqos->dma_regs->rx_dma = regval;
+    eqos->dma_regs->ch0_dma_ie = regval;
 }
 
 void eqos_dma_enable_rxirq(struct tx2_eth_data *dev)
@@ -310,19 +314,42 @@ void eqos_dma_enable_rxirq(struct tx2_eth_data *dev)
     struct eqos_priv *eqos = (struct eqos_priv *)dev->eth_dev;
     uint32_t regval;
 
-    regval = eqos->dma_regs->rx_dma;
+    regval = eqos->dma_regs->ch0_dma_ie;
     regval |= DWCEQOS_DMA_CH0_IE_RIE;
-    eqos->dma_regs->rx_dma = regval;
+    eqos->dma_regs->ch0_dma_ie = regval;
 }
 
-void ack_rx(struct tx2_eth_data *dev)
+void eqos_dma_disable_txirq(struct tx2_eth_data *dev)
+{
+    struct eqos_priv *eqos = (struct eqos_priv *)dev->eth_dev;
+    uint32_t regval;
+
+    regval = eqos->dma_regs->ch0_dma_ie;
+    regval &= ~DWCEQOS_DMA_CH0_IE_TIE;
+    eqos->dma_regs->ch0_dma_ie = regval;
+}
+
+void eqos_dma_enable_txirq(struct tx2_eth_data *dev)
+{
+    struct eqos_priv *eqos = (struct eqos_priv *)dev->eth_dev;
+    uint32_t regval;
+
+    regval = eqos->dma_regs->ch0_dma_ie;
+    regval |= DWCEQOS_DMA_CH0_IE_TIE;
+    eqos->dma_regs->ch0_dma_ie = regval;
+}
+
+void eqos_set_rx_tail_pointer(struct tx2_eth_data *dev)
 {
     struct eqos_priv *eqos = (struct eqos_priv *)dev->eth_dev;
     uint32_t *dma_status = (uint32_t *)(eqos->regs + REG_DWCEQOS_DMA_CH0_STA);
-    *dma_status = DWCEQOS_DMA_CH0_IS_RI;
+    *dma_status |= DWCEQOS_DMA_CH0_IS_RI;
+    size_t num_buffers_in_ring = dev->rx_size - dev->rx_remain;
 
-    uintptr_t last_rx_desc = (dev->rx_ring_phys + ((EQOS_DESCRIPTORS_RX - 1) * (uintptr_t)(sizeof(struct eqos_desc))));
-    eqos->dma_regs->ch0_rxdesc_tail_pointer = last_rx_desc;
+    if (num_buffers_in_ring > 0) {
+        uintptr_t last_rx_desc = (dev->rx_ring_phys + ((dev->rdh + num_buffers_in_ring) * sizeof(struct eqos_desc)));
+        eqos->dma_regs->ch0_rxdesc_tail_pointer = last_rx_desc;
+    }
 }
 
 int eqos_handle_irq(struct tx2_eth_data *dev, int irq)
@@ -331,20 +358,19 @@ int eqos_handle_irq(struct tx2_eth_data *dev, int irq)
 
     uint32_t cause = eqos->dma_regs->dma_control[0];
     uint32_t *dma_status;
-    int ret = -1;
+    int ret = 0;
 
     if (cause & DWCEQOS_DMA_IS_DC0IS) {
         dma_status = (uint32_t *)(eqos->regs + REG_DWCEQOS_DMA_CH0_STA);
 
-        /* Transmit Interrupt currently polling tx so should never get here */
+        /* Transmit Interrupt */
         if (*dma_status & DWCEQOS_DMA_CH0_IS_TI) {
-            ret = 1;
+            ret |= TX_IRQ;
         }
 
         /* Receive Interrupt */
         if (*dma_status & DWCEQOS_DMA_CH0_IS_RI) {
-            dwceqos_dma_disable_rxirq(eqos);
-            ret = 2;
+            ret |= RX_IRQ;
         }
 
         /* Ack */
@@ -442,38 +468,57 @@ static int eqos_start_clks_tegra186(struct eqos_priv *eqos)
 {
     int ret;
 
-    assert(clock_sys_valid(&eqos->tx2_io_ops->clock_sys));
+    assert(clock_sys_valid(eqos->clock_sys));
 
-    eqos->clk_slave_bus = clk_get_clock(&eqos->tx2_io_ops->clock_sys, CLK_AXI_CBB);
+    eqos->clk_slave_bus = clk_get_clock(eqos->clock_sys, CLK_AXI_CBB);
     if (eqos->clk_slave_bus == NULL) {
         ZF_LOGE("clk_get_clock failed CLK_SLAVE_BUS");
+        return -ENODEV;
     }
-    clk_gate_enable(&eqos->tx2_io_ops->clock_sys, CLK_AXI_CBB, CLKGATE_ON);
-
-
-    eqos->clk_master_bus = clk_get_clock(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_AXI);
-    if (eqos->clk_master_bus == NULL) {
-        ZF_LOGE("clk_get_clock failed CLK_MASTER_BUS");
+    ret = clk_gate_enable(eqos->clock_sys, CLK_GATE_AXI_CBB, CLKGATE_ON);
+    if (ret) {
+        ZF_LOGE("Failed to enable CLK_GATE_AXI_CBB") ;
+        return -EIO;
     }
-    clk_gate_enable(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_AXI, CLKGATE_ON);
 
-    eqos->clk_rx = clk_get_clock(&eqos->tx2_io_ops->clock_sys, CLK_EQOS_RX_INPUT);
+    ret = clk_gate_enable(eqos->clock_sys, CLK_GATE_EQOS_AXI, CLKGATE_ON);
+    if (ret) {
+        ZF_LOGE("Failed to enable CLK_GATE_EQOS_AXI");
+        return -EIO;
+    }
+
+    eqos->clk_rx = clk_get_clock(eqos->clock_sys, CLK_EQOS_RX_INPUT);
     if (eqos->clk_rx == NULL) {
         ZF_LOGE("clk_get_clock failed CLK_RX");
+        return -ENODEV;
     }
-    clk_gate_enable(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_RX, CLKGATE_ON);
+    ret = clk_gate_enable(eqos->clock_sys, CLK_GATE_EQOS_RX, CLKGATE_ON);
+    if (ret) {
+        ZF_LOGE("Failed to enable CLK_GATE_EQOS_RX");
+        return -EIO;
+    }
 
-    eqos->clk_ptp_ref = clk_get_clock(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_PTP_REF);
+    eqos->clk_ptp_ref = clk_get_clock(eqos->clock_sys, CLK_EQOS_PTP_REF);
     if (eqos->clk_ptp_ref == NULL) {
-        ZF_LOGE("clk_get_clock failed CLK_PTP_REF");
+        ZF_LOGE("clk_get_clock failed CLK_EQOS_PTP_REF");
+        return -ENODEV;
     }
-    clk_gate_enable(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_PTP_REF, CLKGATE_ON);
+    ret = clk_gate_enable(eqos->clock_sys, CLK_GATE_EQOS_PTP_REF, CLKGATE_ON);
+    if (ret) {
+        ZF_LOGE("Failed to enable CLK_GATE_EQOS_PTP_REF");
+        return -EIO;
+    }
 
-    eqos->clk_tx = clk_get_clock(&eqos->tx2_io_ops->clock_sys, CLK_EQOS_TX);
+    eqos->clk_tx = clk_get_clock(eqos->clock_sys, CLK_EQOS_TX);
     if (eqos->clk_tx == NULL) {
         ZF_LOGE("clk_get_clock failed CLK_TX");
+        return -ENODEV;
     }
-    clk_gate_enable(&eqos->tx2_io_ops->clock_sys, CLK_GATE_EQOS_TX, CLKGATE_ON);
+    ret = clk_gate_enable(eqos->clock_sys, CLK_GATE_EQOS_TX, CLKGATE_ON);
+    if (ret) {
+        ZF_LOGE("Failed to enable CLK_GATE_EQOS_TX");
+        return -EIO;
+    }
 
     return 0;
 }
@@ -636,6 +681,12 @@ static int eqos_adjust_link(struct eqos_priv *eqos)
         return ret;
     }
 
+    ret = eqos_set_tx_clk_speed_tegra186(eqos);
+    if (ret < 0) {
+        ZF_LOGE("eqos_set_tx_clk_speed() failed: %d", ret);
+        return ret;
+    }
+
     if (en_calibration) {
         ret = eqos_calibrate_pads_tegra186(eqos);
         if (ret < 0) {
@@ -648,11 +699,6 @@ static int eqos_adjust_link(struct eqos_priv *eqos)
             return ret;
         }
     }
-    ret = eqos_set_tx_clk_speed_tegra186(eqos);
-    if (ret < 0) {
-        ZF_LOGE("eqos_set_tx_clk_speed() failed: %d", ret);
-        return ret;
-    }
 
     return 0;
 }
@@ -663,30 +709,21 @@ int eqos_send(struct tx2_eth_data *dev, void *packet, int length)
     volatile struct eqos_desc *tx_desc;
     int i;
 
-    uintptr_t tail = (dev->tx_ring_phys + (uintptr_t)(sizeof(struct eqos_desc) * ((dev->tdt + 1) % EQOS_DESCRIPTORS_TX)));
-    tx_desc =  &(dev->tx_ring[dev->tdt]);
-    dev->tdt++;
-    dev->tdt %= EQOS_DESCRIPTORS_TX;
+    tx_desc = &(dev->tx_ring[dev->tdt]);
 
     tx_desc->des0 = (uintptr_t)packet;
     tx_desc->des1 = 0;
-    tx_desc->des2 = length;
+    tx_desc->des2 = EQOS_DESC2_IOC | length;
+    tx_desc->des3 = EQOS_DESC3_FD | EQOS_DESC3_LD | length;
 
     __sync_synchronize();
 
-    tx_desc->des3 = EQOS_DESC3_OWN | EQOS_DESC3_FD | EQOS_DESC3_LD | length;
+    tx_desc->des3 |= EQOS_DESC3_OWN;
 
-    eqos->dma_regs->ch0_txdesc_tail_pointer = tail;
+    eqos->dma_regs->ch0_txdesc_tail_pointer = (uintptr_t)(&(dev->tx_ring[dev->tdt + 1])) +
+                                              sizeof(struct eqos_desc);
 
-    /* Currenly we use a polling approach, later we can move to interrupt driven tx */
-    for (i = 0; i < 100000000; i++) {
-        if (!(tx_desc->des3 & EQOS_DESC3_OWN)) {
-            return 0;
-        }
-        udelay(1);
-    }
-
-    return -ETIMEDOUT;
+    return 0;
 }
 
 static const struct eqos_config eqos_tegra186_config = {
@@ -715,7 +752,7 @@ static int eqos_start_resets_tegra186(struct eqos_priv *eqos)
         return ret;
     }
 
-    ret = reset_sys_assert(&eqos->reset_sys, RESET_EQOS);
+    ret = reset_sys_assert(eqos->reset_sys, RESET_EQOS);
     if (ret < 0) {
         ZF_LOGF("reset_assert() failed: %d", ret);
         return ret;
@@ -723,7 +760,7 @@ static int eqos_start_resets_tegra186(struct eqos_priv *eqos)
 
     udelay(2);
 
-    ret = reset_sys_deassert(&eqos->reset_sys, RESET_EQOS);
+    ret = reset_sys_deassert(eqos->reset_sys, RESET_EQOS);
     if (ret < 0) {
         ZF_LOGF("reset_deassert() failed: %d", ret);
         return ret;
@@ -768,10 +805,6 @@ int eqos_start(struct tx2_eth_data *d)
         ZF_LOGE("eqos_calibrate_pads() failed: %d", ret);
         goto err_stop_resets;
     }
-
-    rate = eqos_get_tick_clk_rate_tegra186(eqos);
-    val = (rate / 1000000) - 1;
-    writel(val, &eqos->mac_regs->us_tic_counter);
 
     /*
      * if PHY was already connected and configured,
@@ -892,13 +925,6 @@ int eqos_start(struct tx2_eth_data *d)
     dma_ie = (uint32_t *)(eqos->regs + 0xc30);
     *dma_ie = 0x3020100;
 
-    /* Virt channel stuff from the l4t driver
-     * dma_ie = (eqos->regs + 0x8600);
-     * *dma_ie = 3;
-     * dma_ie = (eqos->regs + 0x8604);
-     * *dma_ie = 3;
-     */
-
     /* Configure MAC, not sure if L4T is the same */
     eqos->mac_regs->rxq_ctrl0 =
         (eqos->config->config_mac <<
@@ -907,14 +933,8 @@ int eqos_start(struct tx2_eth_data *d)
     /* Set TX flow control parameters */
     /* Set Pause Time */
     eqos->mac_regs->q0_tx_flow_ctrl = (0xffff << EQOS_MAC_Q0_TX_FLOW_CTRL_PT_SHIFT);
-    /* Assign priority for TX flow control */
-    eqos->mac_regs->txq_prty_map0 =
-        (EQOS_MAC_TXQ_PRTY_MAP0_PSTQ0_MASK <<
-         EQOS_MAC_TXQ_PRTY_MAP0_PSTQ0_SHIFT);
     /* Assign priority for RX flow control */
-    eqos->mac_regs->rxq_ctrl2 =
-        (EQOS_MAC_RXQ_CTRL2_PSRQ0_MASK <<
-         EQOS_MAC_RXQ_CTRL2_PSRQ0_SHIFT);
+    eqos->mac_regs->rxq_ctrl2 = (1 << EQOS_MAC_RXQ_CTRL2_PSRQ0_SHIFT);
 
     /* Enable flow control */
     eqos->mac_regs->q0_tx_flow_ctrl |= (EQOS_MAC_Q0_TX_FLOW_CTRL_TFE);
@@ -945,17 +965,7 @@ int eqos_start(struct tx2_eth_data *d)
     eqos->mac_regs->address0_low = val1;
 
     eqos->mac_regs->configuration &= 0xffcfff7c;
-    eqos->mac_regs->configuration |= DWCEQOS_MAC_CFG_ACS | BIT(21)
-                                     | DWCEQOS_MAC_CFG_TE | DWCEQOS_MAC_CFG_RE;
-
-    /* Enable interrupts mac */
-    dma_ie = (uint32_t *)(eqos->regs + 0x00b4);
-    uint32_t mac_imr_val = 0;
-    mac_imr_val = *dma_ie;
-    mac_imr_val &= (uint32_t)(0x1008);
-    mac_imr_val |= ((0x1) << 0) | ((0x1) << 1) | ((0x1) << 2) |
-                   ((0x1) << 4) | ((0x1) << 5);
-    *dma_ie = mac_imr_val;
+    eqos->mac_regs->configuration |=  DWCEQOS_MAC_CFG_TE | DWCEQOS_MAC_CFG_RE;
 
     /* Configure DMA */
     /* Enable OSP mode */
@@ -984,12 +994,12 @@ int eqos_start(struct tx2_eth_data *d)
     eqos->dma_regs->ch0_rx_control &=
         ~(EQOS_DMA_CH0_RX_CONTROL_RXPBL_MASK <<
           EQOS_DMA_CH0_RX_CONTROL_RXPBL_SHIFT);
-    eqos->dma_regs->ch0_rx_control |= (8 << EQOS_DMA_CH0_RX_CONTROL_RXPBL_SHIFT);
+    eqos->dma_regs->ch0_rx_control |= (1 << EQOS_DMA_CH0_RX_CONTROL_RXPBL_SHIFT);
 
     /* DMA performance configuration */
     val = (2 << EQOS_DMA_SYSBUS_MODE_RD_OSR_LMT_SHIFT) |
           EQOS_DMA_SYSBUS_MODE_EAME | EQOS_DMA_SYSBUS_MODE_BLEN16 |
-          EQOS_DMA_SYSBUS_MODE_BLEN8 | EQOS_DMA_SYSBUS_MODE_BLEN4;
+          EQOS_DMA_SYSBUS_MODE_BLEN8;
     eqos->dma_regs->sysbus_mode = val;
 
     eqos->dma_regs->ch0_txdesc_list_haddress = 0;
@@ -1000,21 +1010,19 @@ int eqos_start(struct tx2_eth_data *d)
     eqos->dma_regs->ch0_rxdesc_list_address = d->rx_ring_phys;
     eqos->dma_regs->ch0_rxdesc_ring_length = EQOS_DESCRIPTORS_RX - 1;
 
-    dma_ie = (uint32_t *)(eqos->regs + 0x1134);
-    *dma_ie = 0;
-
-    /* Enable everything */
-    dma_ie = (uint32_t *)(eqos->regs + 0x1134);
-    *dma_ie = DWCEQOS_DMA_CH0_IE_RIE | DWCEQOS_DMA_CH0_IE_TIE | DWCEQOS_DMA_CH0_IE_NIE | DWCEQOS_DMA_CH0_IE_RBUE |
-              DWCEQOS_DMA_CH0_IE_AIE | DWCEQOS_DMA_CH0_IE_FBEE;
+    eqos->dma_regs->ch0_dma_ie = 0;
+    eqos->dma_regs->ch0_dma_ie = DWCEQOS_DMA_CH0_IE_RIE | DWCEQOS_DMA_CH0_IE_TIE |
+                                 DWCEQOS_DMA_CH0_IE_NIE | DWCEQOS_DMA_CH0_IE_AIE |
+                                 DWCEQOS_DMA_CH0_IE_FBEE;
 
     udelay(100);
 
     eqos->dma_regs->ch0_tx_control = EQOS_DMA_CH0_TX_CONTROL_ST;
     eqos->dma_regs->ch0_rx_control = EQOS_DMA_CH0_RX_CONTROL_SR;
 
-    last_rx_desc = (d->rx_ring_phys + ((EQOS_DESCRIPTORS_RX - 1) * (uintptr_t)(sizeof(struct eqos_desc))));
-    eqos->dma_regs->ch0_rxdesc_tail_pointer = last_rx_desc;
+    eqos->last_rx_desc = (d->rx_ring_phys + ((EQOS_DESCRIPTORS_RX) * (uintptr_t)(sizeof(struct eqos_desc))));
+    eqos->last_tx_desc = (d->tx_ring_phys + ((EQOS_DESCRIPTORS_TX) * (uintptr_t)(sizeof(struct eqos_desc))));
+
 
     return 0;
 
@@ -1027,6 +1035,112 @@ err_stop_clks:
 err:
     ZF_LOGE("FAILED: %d", ret);
     return ret;
+}
+
+static int hardware_interface_searcher(void *handler_data, void *interface_instance, char **properties)
+{
+
+    /* For now, just take the first one that appears, note that we pass the
+     * pointer of each individual subsystem as the cookie. */
+    *((void **) handler_data) = interface_instance;
+    return PS_INTERFACE_FOUND_MATCH;
+}
+
+static int tx2_initialise_hardware(struct eqos_priv *eqos)
+{
+    if (!eqos) {
+        ZF_LOGE("eqos is NULL");
+        return -EINVAL;
+    }
+
+    bool found_clock_interface = false;
+    bool found_reset_interface = false;
+    bool found_gpio_interface = false;
+
+    /* Check if a clock, reset, and gpio interface was registered, if not
+     * initialise them ourselves */
+    int error = ps_interface_find(&eqos->tx2_io_ops->interface_registration_ops,
+                                  PS_CLOCK_INTERFACE, hardware_interface_searcher, &eqos->clock_sys);
+    if (!error) {
+        found_clock_interface = true;
+    }
+
+    error = ps_interface_find(&eqos->tx2_io_ops->interface_registration_ops,
+                              PS_RESET_INTERFACE, hardware_interface_searcher, &eqos->reset_sys);
+    if (!error) {
+        found_reset_interface = true;
+    }
+
+    error = ps_interface_find(&eqos->tx2_io_ops->interface_registration_ops,
+                              PS_GPIO_INTERFACE, hardware_interface_searcher, &eqos->gpio_sys);
+    if (!error) {
+        found_gpio_interface = true;
+    }
+
+    if (found_clock_interface && found_reset_interface && found_gpio_interface) {
+        return 0;
+    }
+
+    if (!found_clock_interface) {
+        ZF_LOGW("Did not found a suitable clock interface, going to be initialising our own");
+        error = ps_calloc(&eqos->tx2_io_ops->malloc_ops, 1, sizeof(*(eqos->clock_sys)),
+                          (void **) &eqos->clock_sys);
+        if (error) {
+            /* Too early to be cleaning up anything */
+            return error;
+        }
+        error = clock_sys_init(eqos->tx2_io_ops, eqos->clock_sys);
+        if (error) {
+            goto fail;
+        }
+    }
+
+    if (!found_reset_interface) {
+        ZF_LOGW("Did not found a suitable reset interface, going to be initialising our own");
+        error = ps_calloc(&eqos->tx2_io_ops->malloc_ops, 1, sizeof(*(eqos->reset_sys)),
+                          (void **) &eqos->reset_sys);
+        if (error) {
+            goto fail;
+        }
+        error = reset_sys_init(eqos->tx2_io_ops, NULL, eqos->reset_sys);
+        if (error) {
+            goto fail;
+        }
+    }
+
+    if (!found_gpio_interface) {
+        ZF_LOGW("Did not found a suitable gpio interface, going to be initialising our own");
+        error = ps_calloc(&eqos->tx2_io_ops->malloc_ops, 1, sizeof(*(eqos->gpio_sys)),
+                          (void **) &eqos->gpio_sys);
+        if (error) {
+            goto fail;
+        }
+        error = gpio_sys_init(eqos->tx2_io_ops, eqos->gpio_sys);
+        if (error) {
+            goto fail;
+        }
+    }
+
+    return 0;
+
+fail:
+
+    if (eqos->clock_sys) {
+        ZF_LOGF_IF(ps_free(&eqos->tx2_io_ops->malloc_ops, sizeof(*(eqos->clock_sys)), eqos->clock_sys),
+                   "Failed to clean up the clock interface after a failed initialisation process");
+    }
+
+    if (eqos->reset_sys) {
+        ZF_LOGF_IF(ps_free(&eqos->tx2_io_ops->malloc_ops, sizeof(*(eqos->reset_sys)), eqos->reset_sys),
+                   "Failed to clean up the reset interface after a failed initialisation process");
+    }
+
+    if (eqos->gpio_sys) {
+        ZF_LOGF_IF(ps_free(&eqos->tx2_io_ops->malloc_ops, sizeof(*(eqos->gpio_sys)), eqos->gpio_sys),
+                   "Failed to clean up the gpio interface after a failed initialisation process");
+    }
+
+    return error;
 }
 
 void *tx2_initialise(uintptr_t base_addr, ps_io_ops_t *io_ops)
@@ -1054,26 +1168,15 @@ void *tx2_initialise(uintptr_t base_addr, ps_io_ops_t *io_ops)
         ZF_LOGF("failed to initialise phy");
     }
 
-    /* initialise clock subsystem */
-    ret = clock_sys_init(eqos->tx2_io_ops, &eqos->tx2_io_ops->clock_sys);
-    if (ret != 0) {
-        ZF_LOGF("failed to initialise clock sub system");
+    ret = tx2_initialise_hardware(eqos);
+    if (ret) {
+        return NULL;
     }
 
-    /* initialise gpio subsystem */
-    ret = gpio_sys_init(eqos->tx2_io_ops, &eqos->gpio_sys);
-    if (ret != 0) {
-        ZF_LOGF("failed to initialise gpio sub system");
-    }
-    ret = eqos->gpio_sys.init(&eqos->gpio_sys, GPIO_PM4, GPIO_DIR_OUT, &eqos->gpio);
+    /* initialise the phy reset gpio gpio */
+    ret = eqos->gpio_sys->init(eqos->gpio_sys, GPIO_PM4, GPIO_DIR_OUT, &eqos->gpio);
     if (ret != 0) {
         ZF_LOGF("failed to init phy reset gpio pin");
-    }
-
-    /* initialise resets */
-    ret = reset_sys_init(eqos->tx2_io_ops, NULL, &eqos->reset_sys);
-    if (ret != 0) {
-        ZF_LOGF("failed to initialise resets");
     }
 
     eqos->config = &eqos_tegra186_config;

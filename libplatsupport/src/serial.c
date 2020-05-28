@@ -15,12 +15,15 @@
 #include <platsupport/serial.h>
 #include "chardev.h"
 
-ssize_t
-uart_write(ps_chardevice_t* d, const void* vdata, size_t count, chardev_callback_t rcb UNUSED, void* token UNUSED)
+ssize_t uart_write(
+    ps_chardevice_t *d,
+    const void *vdata,
+    size_t count,
+    chardev_callback_t rcb UNUSED,
+    void *token UNUSED)
 {
-    const unsigned char* data = (const unsigned char*)vdata;
-    int i;
-    for (i = 0; i < count; i++) {
+    const unsigned char *data = (const unsigned char *)vdata;
+    for (int i = 0; i < count; i++) {
         if (uart_putchar(d, data[i]) < 0) {
             return i;
         }
@@ -28,20 +31,20 @@ uart_write(ps_chardevice_t* d, const void* vdata, size_t count, chardev_callback
     return count;
 }
 
-ssize_t
-uart_read(ps_chardevice_t* d, void* vdata, size_t count, chardev_callback_t rcb UNUSED, void* token UNUSED)
+ssize_t uart_read(
+    ps_chardevice_t *d,
+    void *vdata,
+    size_t count,
+    chardev_callback_t rcb UNUSED,
+    void *token UNUSED)
 {
-    char* data;
-    int ret;
-    int i;
-    data = (char*) vdata;
-    for (i = 0; i < count; i++) {
-        ret = uart_getchar(d);
-        if (ret != EOF) {
-            data[i] = ret;
-        } else {
+    char *data = (char *)vdata;
+    for (int i = 0; i < count; i++) {
+        int ret = uart_getchar(d);
+        if (EOF == ret) {
             return i;
         }
+        data[i] = ret;
     }
     return count;
 }

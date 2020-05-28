@@ -10,6 +10,8 @@
  * @TAG(DATA61_GPL)
  */
 
+#include <platsupport/fdt.h>
+#include <platsupport/driver_module.h>
 #include <ethdrivers/tx2.h>
 #include <ethdrivers/raw.h>
 #include <ethdrivers/helpers.h>
@@ -72,9 +74,9 @@ static int initialize_desc_ring(struct tx2_eth_data *dev, ps_dma_man_t *dma_man,
     ps_dma_cache_clean_invalidate(dma_man, rx_ring.virt, sizeof(struct eqos_desc) * dev->rx_size);
     ps_dma_cache_clean_invalidate(dma_man, tx_ring.virt, sizeof(struct eqos_desc) * dev->tx_size);
 
-    dev->rx_cookies = malloc(sizeof(void *) * dev->rx_size);
-    dev->tx_cookies = malloc(sizeof(void *) * dev->tx_size);
-    dev->tx_lengths = malloc(sizeof(unsigned int) * dev->tx_size);
+    dev->rx_cookies = calloc(1, sizeof(void *) * dev->rx_size);
+    dev->tx_cookies = calloc(1, sizeof(void *) * dev->tx_size);
+    dev->tx_lengths = calloc(1, sizeof(unsigned int) * dev->tx_size);
 
     if (dev->rx_cookies == NULL || dev->tx_cookies == NULL || dev->tx_lengths == NULL) {
 
@@ -97,8 +99,8 @@ static int initialize_desc_ring(struct tx2_eth_data *dev, ps_dma_man_t *dma_man,
 
     /* Remaining needs to be 2 less than size as we cannot actually enqueue size many descriptors,
      * since then the head and tail pointers would be equal, indicating empty. */
-    dev->rx_remain = dev->rx_size - 1;
-    dev->tx_remain = dev->tx_size - 1;
+    dev->rx_remain = dev->rx_size;
+    dev->tx_remain = dev->tx_size;
 
     dev->rdt = dev->rdh = dev->tdt = dev->tdh = 0;
 
@@ -114,38 +116,48 @@ static int initialize_desc_ring(struct tx2_eth_data *dev, ps_dma_man_t *dma_man,
 static void fill_rx_bufs(struct eth_driver *driver)
 {
     struct tx2_eth_data *dev = (struct tx2_eth_data *)driver->eth_data;
-    __sync_synchronize();
+
     while (dev->rx_remain > 0) {
 
         void *cookie = NULL;
         /* request a buffer */
-        uintptr_t phys = driver->i_cb.allocate_rx_buf(driver->cb_cookie, EQOS_MAX_PACKET_SIZE, &cookie);
+        uintptr_t phys = driver->i_cb.allocate_rx_buf ? driver->i_cb.allocate_rx_buf(driver->cb_cookie, EQOS_MAX_PACKET_SIZE,
+                                                                                     &cookie) : 0;
+
         if (!phys) {
             break;
+        }
+
+        if (dev->rx_cookies[dev->rdt] != NULL) {
+            ZF_LOGF("Overwriting a descriptor at dev->rdt %d", dev->rdt);
         }
 
         dev->rx_cookies[dev->rdt] = cookie;
         dev->rx_ring[dev->rdt].des0 = phys;
         dev->rx_ring[dev->rdt].des1 = 0;
         dev->rx_ring[dev->rdt].des2 = 0;
-        __sync_synchronize();
         dev->rx_ring[dev->rdt].des3 = EQOS_DESC3_OWN | EQOS_DESC3_BUF1V | DWCEQOS_DMA_RDES3_INTE;
 
         dev->rdt = (dev->rdt + 1) % dev->rx_size;
         dev->rx_remain--;
     }
+    __sync_synchronize();
+
+    if (dev->rx_remain != dev->rx_size) {
+        /* We've refilled some buffers, so set the tail pointer so that the DMA controller knows */
+        eqos_set_rx_tail_pointer(dev);
+    }
 
     __sync_synchronize();
-    ack_rx(dev);
-
 }
 
 static void complete_rx(struct eth_driver *eth_driver)
 {
     struct tx2_eth_data *dev = (struct tx2_eth_data *)eth_driver->eth_data;
-    unsigned int rdt = dev->rdt;
+    unsigned int num_in_ring = dev->rx_size - dev->rx_remain;
+    bool did_rx = false;
 
-    while (dev->rdh != rdt) {
+    for (int i = 0; i < num_in_ring; i++) {
         unsigned int status = dev->rx_ring[dev->rdh].des3;
 
         /* Ensure no memory references get ordered before we checked the descriptor was written back */
@@ -157,6 +169,7 @@ static void complete_rx(struct eth_driver *eth_driver)
 
         /* TBD: Need to handle multiple buffers for single frame? */
         void *cookie = dev->rx_cookies[dev->rdh];
+        dev->rx_cookies[dev->rdh] = 0;
         unsigned int len = status & 0x7fff;
 
         dev->rx_remain++;
@@ -172,8 +185,10 @@ static void complete_tx(struct eth_driver *driver)
 {
     struct tx2_eth_data *dev = (struct tx2_eth_data *)driver->eth_data;
     volatile struct eqos_desc *tx_desc;
+    unsigned int num_in_ring = dev->tx_size - dev->tx_remain;
+    bool did_tx = false;
 
-    while (dev->tdh != dev->tdt) {
+    for (int i = 0; i < num_in_ring; i++) {
         uint32_t i;
         for (i = 0; i < dev->tx_lengths[dev->tdh]; i++) {
             uint32_t ring_pos = (i + dev->tdh) % dev->tx_size;
@@ -202,18 +217,25 @@ static void handle_irq(struct eth_driver *driver, int irq)
     struct tx2_eth_data *eth_data = (struct tx2_eth_data *)driver->eth_data;
     uint32_t val = eqos_handle_irq(eth_data, irq);
 
-    if (val == TXIRQ) {
+    if (val & TX_IRQ) {
+        eqos_dma_disable_txirq(eth_data);
         complete_tx(driver);
+        eqos_dma_enable_txirq(eth_data);
     }
 
-    if (val == RXIRQ) {
+    if (val & RX_IRQ) {
+        eqos_dma_disable_rxirq(eth_data);
         complete_rx(driver);
         fill_rx_bufs(driver);
+        /*
+         * RX IRQ is was disabled when checking the IRQ, and thus need to be
+         * re-enabled
+         */
         eqos_dma_enable_rxirq(eth_data);
     }
 
-    if (val == -1) {
-        ZF_LOGF("Something went wrong");
+    if (val == 0) {
+        ZF_LOGD("No TX or RX IRQ, ignoring this interrupt");
     }
 }
 
@@ -253,6 +275,7 @@ static int raw_tx(struct eth_driver *driver, unsigned int num, uintptr_t *phys,
         if (err == -ETIMEDOUT) {
             ZF_LOGF("send timed out");
         }
+        dev->tdt = (dev->tdt + 1) % dev->tx_size;
     }
 
     dev->tx_remain -= num;
@@ -335,3 +358,120 @@ error:
     free_desc_ring(eth_data, &io_ops.dma_manager);
     return -1;
 }
+
+static void eth_irq_handle(void *data, ps_irq_acknowledge_fn_t acknowledge_fn, void *ack_data)
+{
+
+    struct eth_driver *eth = data;
+
+    handle_irq(eth, 0);
+
+    int error = acknowledge_fn(ack_data);
+    if (error) {
+        LOG_ERROR("Failed to acknowledge IRQ");
+    }
+
+}
+
+typedef struct {
+    void *addr;
+    ps_io_ops_t *io_ops;
+    struct eth_driver *eth_driver;
+} callback_args_t;
+
+static int allocate_register_callback(pmem_region_t pmem, unsigned curr_num, size_t num_regs, void *token)
+{
+    if (token == NULL) {
+        return -EINVAL;
+    }
+
+    callback_args_t *args = token;
+    if (curr_num == 0) {
+        args->addr = ps_pmem_map(args->io_ops, pmem, false, PS_MEM_NORMAL);
+        if (!args->addr) {
+            ZF_LOGE("Failed to map the Eth device");
+            return -EIO;
+        }
+
+    }
+    return 0;
+}
+
+static int allocate_irq_callback(ps_irq_t irq, unsigned curr_num, size_t num_irqs, void *token)
+{
+    if (token == NULL) {
+        return -EINVAL;
+    }
+    callback_args_t *args = token;
+    /* Skip all interrupts except the first */
+    if (curr_num != 0) {
+        return 0;
+    }
+
+    int res = ps_irq_register(&args->io_ops->irq_ops, irq, eth_irq_handle, args->eth_driver);
+    if (res < 0) {
+        return -EIO;
+    }
+
+    return 0;
+}
+
+
+int ethif_tx2_init_module(ps_io_ops_t *io_ops, const char *device_path)
+{
+
+    struct arm_eth_plat_config plat_config;
+    struct eth_driver *eth_driver;
+    int error = ps_calloc(&io_ops->malloc_ops, 1, sizeof(*eth_driver), (void **)&eth_driver);
+    if (error) {
+        ZF_LOGE("Failed to allocate struct for eth_driver");
+        return -1;
+    }
+
+    ps_fdt_cookie_t *cookie = NULL;
+    callback_args_t args = {.io_ops = io_ops, .eth_driver = eth_driver};
+    /* read the ethernet's path in the DTB */
+    error = ps_fdt_read_path(&io_ops->io_fdt, &io_ops->malloc_ops, device_path, &cookie);
+    if (error) {
+        return -ENODEV;
+    }
+
+
+    /* walk the registers and allocate them */
+    error = ps_fdt_walk_registers(&io_ops->io_fdt, cookie, allocate_register_callback, &args);
+    if (error) {
+        return -ENODEV;
+    }
+    if (args.addr == NULL) {
+        return -ENODEV;
+    }
+
+    /* walk the interrupts and allocate the first */
+    error = ps_fdt_walk_irqs(&io_ops->io_fdt, cookie, allocate_irq_callback, &args);
+    if (error) {
+        return -ENODEV;
+    }
+
+    error = ps_fdt_cleanup_cookie(&io_ops->malloc_ops, cookie);
+    if (error) {
+        return -ENODEV;
+    }
+    plat_config.buffer_addr = args.addr;
+    plat_config.prom_mode = 1;
+
+
+    error = ethif_tx2_init(eth_driver, *io_ops, &plat_config);
+    if (error) {
+        return -ENODEV;
+    }
+
+    return ps_interface_register(&io_ops->interface_registration_ops, PS_ETHERNET_INTERFACE, eth_driver, NULL);
+
+}
+
+static const char *compatible_strings[] = {
+    "nvidia,eqos",
+    NULL
+};
+
+PS_DRIVER_MODULE_DEFINE(tx2_ether_qos, compatible_strings, ethif_tx2_init_module);
