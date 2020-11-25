@@ -81,15 +81,16 @@ struct imx_uart_regs {
 };
 typedef volatile struct imx_uart_regs imx_uart_regs_t;
 
-static inline imx_uart_regs_t*
-imx_uart_get_priv(ps_chardevice_t *d)
+static inline imx_uart_regs_t *imx_uart_get_priv(
+    ps_chardevice_t *d)
 {
-    return (imx_uart_regs_t*)d->vaddr;
+    return (imx_uart_regs_t *)d->vaddr;
 }
 
-int uart_getchar(ps_chardevice_t *d)
+int uart_getchar(
+    ps_chardevice_t *d)
 {
-    imx_uart_regs_t* regs = imx_uart_get_priv(d);
+    imx_uart_regs_t *regs = imx_uart_get_priv(d);
     uint32_t reg = 0;
     int c = -1;
 
@@ -102,22 +103,53 @@ int uart_getchar(ps_chardevice_t *d)
     return c;
 }
 
-int uart_putchar(ps_chardevice_t* d, int c)
+static int internal_is_tx_fifo_busy(
+    imx_uart_regs_t *regs)
 {
-    imx_uart_regs_t* regs = imx_uart_get_priv(d);
-    if (regs->sr2 & UART_SR2_TXFIFO_EMPTY) {
-        if (c == '\n' && (d->flags & SERIAL_AUTO_CR)) {
-            uart_putchar(d, '\r');
-        }
-        regs->txd = c;
-        return c;
-    } else {
-        return -1;
-    }
+    /* check the TXFE (transmit buffer FIFO empty) flag, which is cleared
+     * automatically when data is written to the TxFIFO. Even though the flag
+     * is set, the actual data transmission via the UART's 32 byte FIFO buffer
+     * might still be in progress.
+     */
+    return (0 == (regs->sr2 & UART_SR2_TXFIFO_EMPTY));
 }
 
-static void
-uart_handle_irq(ps_chardevice_t* d UNUSED)
+int uart_putchar(
+    ps_chardevice_t *d,
+    int c)
+{
+    imx_uart_regs_t *regs = imx_uart_get_priv(d);
+
+    if (internal_is_tx_fifo_busy(regs)) {
+        return -1;
+    }
+
+    if (c == '\n' && (d->flags & SERIAL_AUTO_CR)) {
+        /* write CR first */
+        regs->txd = '\r';
+        /* if we transform a '\n' (LF) into '\r\n' (CR+LF) this shall become an
+         * atom, ie we don't want CR to be sent and then fail at sending LF
+         * because the TX FIFO is full. Basically there are two options:
+         *   - check if the FIFO can hold CR+LF and either send both or none
+         *   - send CR, then block until the FIFO has space and send LF.
+         * Assuming that if SERIAL_AUTO_CR is set, it's likely this is a serial
+         * console for logging, so blocking seems acceptable in this special
+         * case. The IMX6's TX FIFO size is 32 byte and TXFIFO_EMPTY is cleared
+         * automatically as soon as data is written from regs->txd into the
+         * FIFO. Thus the worst case blocking is roughly the time it takes to
+         * send 1 byte to have room in the FIFO again. At 115200 baud with 8N1
+         * this takes 10 bit-times, which is 10/115200 = 86,8 usec.
+         */
+        while (internal_is_tx_fifo_busy(regs)) {
+            /* busy loop */
+        }
+    }
+
+    regs->txd = c;
+    return c;
+}
+
+static void uart_handle_irq(ps_chardevice_t *d UNUSED)
 {
     /* TODO */
 }
@@ -126,10 +158,11 @@ uart_handle_irq(ps_chardevice_t* d UNUSED)
  * BaudRate = RefFreq / (16 * (BMR + 1)/(BIR + 1) )
  * BMR and BIR are 16 bit
  */
-static void
-imx_uart_set_baud(ps_chardevice_t* d, long bps)
+static void imx_uart_set_baud(
+    ps_chardevice_t *d,
+    long bps)
 {
-    imx_uart_regs_t* regs = imx_uart_get_priv(d);
+    imx_uart_regs_t *regs = imx_uart_get_priv(d);
     uint32_t bmr, bir, fcr;
     fcr = regs->fcr;
     fcr &= ~UART_FCR_RFDIV_MASK;
@@ -141,10 +174,14 @@ imx_uart_set_baud(ps_chardevice_t* d, long bps)
     regs->fcr = fcr;
 }
 
-int
-serial_configure(ps_chardevice_t* d, long bps, int char_size, enum serial_parity parity, int stop_bits)
+int serial_configure(
+    ps_chardevice_t *d,
+    long bps,
+    int char_size,
+    enum serial_parity parity,
+    int stop_bits)
 {
-    imx_uart_regs_t* regs = imx_uart_get_priv(d);
+    imx_uart_regs_t *regs = imx_uart_get_priv(d);
     uint32_t cr2;
     /* Character size */
     cr2 = regs->cr2;
@@ -184,14 +221,13 @@ serial_configure(ps_chardevice_t* d, long bps, int char_size, enum serial_parity
     return 0;
 }
 
-int uart_init(const struct dev_defn* defn,
-              const ps_io_ops_t* ops,
-              ps_chardevice_t* dev)
+int uart_init(
+    const struct dev_defn *defn,
+    const ps_io_ops_t *ops,
+    ps_chardevice_t *dev)
 {
-    imx_uart_regs_t* regs;
-
     /* Attempt to map the virtual address, assure this works */
-    void* vaddr = chardev_map(defn, ops);
+    void *vaddr = chardev_map(defn, ops);
     if (vaddr == NULL) {
         return -1;
     }
@@ -200,7 +236,7 @@ int uart_init(const struct dev_defn* defn,
 
     /* Set up all the  device properties. */
     dev->id         = defn->id;
-    dev->vaddr      = (void*)vaddr;
+    dev->vaddr      = (void *)vaddr;
     dev->read       = &uart_read;
     dev->write      = &uart_write;
     dev->handle_irq = &uart_handle_irq;
@@ -208,7 +244,7 @@ int uart_init(const struct dev_defn* defn,
     dev->ioops      = *ops;
     dev->flags      = SERIAL_AUTO_CR;
 
-    regs = imx_uart_get_priv(dev);
+    imx_uart_regs_t *regs = imx_uart_get_priv(dev);
 
     /* Software reset */
     regs->cr2 &= ~UART_CR2_SRST;
@@ -231,12 +267,12 @@ int uart_init(const struct dev_defn* defn,
 
 #ifdef CONFIG_PLAT_IMX6
 #include <platsupport/plat/mux.h>
-    /* The UART1 on the IMX6 has the problem that the MUX is not correctly set, and the RX PIN is 
-     * not routed correctly.
+    /* The UART1 on the IMX6 has the problem that the MUX is not correctly set,
+     * and the RX PIN is not routed correctly.
      */
     if ((defn->id == IMX_UART1) && mux_sys_valid(&ops->mux_sys)) {
         if (mux_feature_enable(&ops->mux_sys, MUX_UART1, 0)) {
-            // Failed to configure the mux 
+            /* Failed to configure the mux */
             return -1;
         }
     }

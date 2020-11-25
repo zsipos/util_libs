@@ -22,6 +22,7 @@
 #include "tx2.h"
 #include "io.h"
 
+#include "uboot/dwc_eth_qos.h"
 static void free_desc_ring(struct tx2_eth_data *dev, ps_dma_man_t *dma_man)
 {
     if (dev->rx_ring != NULL) {
@@ -106,7 +107,7 @@ static int initialize_desc_ring(struct tx2_eth_data *dev, ps_dma_man_t *dma_man,
 
     /* zero both rings */
     memset((void *)dev->tx_ring, 0, sizeof(struct eqos_desc) * dev->tx_size);
-    memset((void *)dev->rx_ring, 0, sizeof(struct eqos_desc) * dev->tx_size);
+    memset((void *)dev->rx_ring, 0, sizeof(struct eqos_desc) * dev->rx_size);
 
     __sync_synchronize();
 
@@ -136,7 +137,7 @@ static void fill_rx_bufs(struct eth_driver *driver)
         dev->rx_ring[dev->rdt].des0 = phys;
         dev->rx_ring[dev->rdt].des1 = 0;
         dev->rx_ring[dev->rdt].des2 = 0;
-        dev->rx_ring[dev->rdt].des3 = EQOS_DESC3_OWN | EQOS_DESC3_BUF1V | DWCEQOS_DMA_RDES3_INTE;
+        dev->rx_ring[dev->rdt].des3 = EQOS_DESC3_OWN | EQOS_DESC3_BUF1V;
 
         dev->rdt = (dev->rdt + 1) % dev->rx_size;
         dev->rx_remain--;
@@ -155,7 +156,6 @@ static void complete_rx(struct eth_driver *eth_driver)
 {
     struct tx2_eth_data *dev = (struct tx2_eth_data *)eth_driver->eth_data;
     unsigned int num_in_ring = dev->rx_size - dev->rx_remain;
-    bool did_rx = false;
 
     for (int i = 0; i < num_in_ring; i++) {
         unsigned int status = dev->rx_ring[dev->rdh].des3;
@@ -185,10 +185,8 @@ static void complete_tx(struct eth_driver *driver)
 {
     struct tx2_eth_data *dev = (struct tx2_eth_data *)driver->eth_data;
     volatile struct eqos_desc *tx_desc;
-    unsigned int num_in_ring = dev->tx_size - dev->tx_remain;
-    bool did_tx = false;
 
-    for (int i = 0; i < num_in_ring; i++) {
+    while ((dev->tx_size - dev->tx_remain) > 0) {
         uint32_t i;
         for (i = 0; i < dev->tx_lengths[dev->tdh]; i++) {
             uint32_t ring_pos = (i + dev->tdh) % dev->tx_size;
@@ -254,14 +252,13 @@ static int raw_tx(struct eth_driver *driver, unsigned int num, uintptr_t *phys,
 {
     assert(num == 1);
     struct tx2_eth_data *dev = (struct tx2_eth_data *)driver->eth_data;
-    struct eth_device *enet = dev->eth_dev;
     int err;
     /* Ensure we have room */
-    if (dev->tx_remain < num) {
+    if ((dev->tx_size - dev->tx_remain) > 32) {
         /* try and complete some */
         complete_tx(driver);
         if (dev->tx_remain < num) {
-            ZF_LOGF("Raw TX failed");
+            ZF_LOGE("Raw TX failed");
             return ETHIF_TX_FAILED;
         }
     }

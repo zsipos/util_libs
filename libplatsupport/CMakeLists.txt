@@ -14,6 +14,14 @@ cmake_minimum_required(VERSION 3.7.2)
 
 project(libplatsupport C)
 
+# HACK: This is a stop-gap measure for now to allow projects that don't
+# use the CMake modules feature of our build system to build properly.
+# Some projects in particular that need to be fixed:
+#   - rumprun-sel4-demoapps
+if(NOT ${PLATSUPPORT_HELPERS} STREQUAL "")
+    include(${PLATSUPPORT_HELPERS})
+endif()
+
 set(configure_string "")
 
 config_choice(
@@ -63,6 +71,9 @@ if(${KernelArch} STREQUAL "arm")
 elseif(${KernelArch} STREQUAL "x86")
     list(APPEND deps src/arch/x86/delay.c)
     list(APPEND deps src/arch/x86/tsc.c)
+elseif(${KernelArch} STREQUAL "riscv")
+    list(APPEND deps src/arch/riscv/irqchip/plic.c)
+    list(APPEND irqchip_modules "-Wl,--undefined=riscv_plic_ptr")
 endif()
 
 if(KernelPlatformQEMUArmVirt)

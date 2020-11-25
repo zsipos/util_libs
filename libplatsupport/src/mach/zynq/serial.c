@@ -148,14 +148,14 @@ struct zynq_uart_regs {
     uint32_t mr;            /* 0x04 Mode Register */
     uint32_t ier;           /* 0x08 Interrupt Enable Register */
     uint32_t idr;           /* 0x0C Interrupt Disable Register */
-    uint32_t imr;           /* 0x10 Interrupt Mask Register */
-    uint32_t isr;           /* 0x14 Channel Interrupt Status Register */
+    uint32_t imr;           /* 0x10 Interrupt Mask Register (read-only) */
+    uint32_t isr;           /* 0x14 Channel Interrupt Status Register (write a 1 to clear) */
     uint32_t baudgen;       /* 0x18 Baud Rate Generator Register */
     uint32_t rxtout;        /* 0x1C Receiver Timeout Register */
     uint32_t rxwm;          /* 0x20 Receiver FIFO Trigger Level Register */
     uint32_t modemcr;       /* 0x24 Modem Control Register */
     uint32_t modemsr;       /* 0x28 Modem Status Register */
-    uint32_t sr;            /* 0x2C Channel Status Register */
+    uint32_t sr;            /* 0x2C Channel Status Register (read-only) */
     uint32_t fifo;          /* 0x30 Transmit and Receive FIFO */
     uint32_t bauddiv;       /* 0x34 Baud Rate Divider Register */
     uint32_t flowdel;       /* 0x38 Flow Control Delay Register */
@@ -195,9 +195,11 @@ int uart_getchar(
     if (!(regs->sr & UART_SR_REMPTY)) {
         c = regs->fifo;
 
-        /* Clear the Rx timeout interrupt status bit if set */
+        /* Clear the Rx timeout interrupt status bit if set. Register
+         * implements the "write a 1 to clear" semantic.
+         */
         if (regs->isr & UART_ISR_TIMEOUT) {
-            regs->isr &= ~UART_ISR_TIMEOUT;
+            regs->isr = UART_ISR_TIMEOUT;
         }
     }
 
@@ -243,7 +245,7 @@ static void uart_handle_irq(
     ps_chardevice_t *d)
 {
     zynq_uart_regs_t *regs = zynq_uart_get_priv(d);
-    regs->isr = UART_IER_RTRIG;
+    regs->isr = UART_ISR_RTRIG;
 }
 
 /*
@@ -414,15 +416,25 @@ int serial_configure(
 
 static void zynq_uart_dev_init(
     ps_chardevice_t *dev,
-    const ps_io_ops_t *ops)
+    const ps_io_ops_t *ops,
+    enum chardev_id id,
+    void *vaddr,
+    const int *irqs)
 {
+    assert(NULL != dev);
+
     memset(dev, 0, sizeof(*dev));
 
     /* Set up all the  device properties. */
+    dev->id         = id;
+    dev->vaddr      = vaddr;
+    dev->irqs       = irqs;
+
     dev->read       = &uart_read;
     dev->write      = &uart_write;
     dev->handle_irq = &uart_handle_irq;
     dev->ioops      = *ops;
+
     dev->flags      = SERIAL_AUTO_CR;
 }
 
@@ -474,11 +486,20 @@ int uart_static_init(
     const ps_io_ops_t *ops,
     ps_chardevice_t *dev)
 {
-    zynq_uart_dev_init(dev, ops);
-    dev->vaddr = vaddr;
+    assert(NULL != vaddr);
+    assert(NULL != ops);
+    assert(NULL != dev);
 
-    int error = zynq_uart_init(dev);
-    return error;
+    /* There is a design quirk here, no context information is passed which
+     * UART this is and what interrupt it uses. So we have set something now
+     * to make this well defined. ZYNQ_UART0 seem a good choice, because this
+     * is what the callers usually want. The contents of the interrupt field
+     * are not used in the driver, so we set this to NULL.
+     */
+
+    zynq_uart_dev_init(dev, ops, ZYNQ_UART0, vaddr, NULL);
+
+    return zynq_uart_init(dev);
 
 }
 
@@ -487,18 +508,17 @@ int uart_init(
     const ps_io_ops_t *ops,
     ps_chardevice_t *dev)
 {
+    assert(NULL != defn);
+    assert(NULL != ops);
+    assert(NULL != dev);
+
     /* Attempt to map the virtual address, assure this works */
     void *vaddr = chardev_map(defn, ops);
     if (vaddr == NULL) {
         return -1;
     }
 
-    zynq_uart_dev_init(dev, ops);
-    /* Set up the remaining device properties. */
-    dev->id         = defn->id;
-    dev->vaddr      = (void *)vaddr;
-    dev->irqs       = defn->irqs;
+    zynq_uart_dev_init(dev, ops, defn->id, vaddr, defn->irqs);
 
-    int error = zynq_uart_init(dev);
-    return error;
+    return zynq_uart_init(dev);
 }

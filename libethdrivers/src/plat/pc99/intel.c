@@ -211,6 +211,8 @@ typedef struct e1000_dev {
     uint32_t tx_cmd_bits;
     /* whether we believe the link is up or not */
     int link_up;
+    /* if the rx ring is empty */
+    bool need_rx_buffers;
 } e1000_dev_t;
 
 static void disable_all_interrupts(e1000_dev_t *dev)
@@ -906,6 +908,7 @@ static int fill_rx_bufs(struct eth_driver *driver)
         void *cookie;
         uintptr_t phys = driver->i_cb.allocate_rx_buf ? driver->i_cb.allocate_rx_buf(driver->cb_cookie, BUF_SIZE, &cookie) : 0;
         if (!phys) {
+            dev->need_rx_buffers = true;
             break;
         }
         dev->rx_cookies[dev->rdt] = cookie;
@@ -931,6 +934,11 @@ static int fill_rx_bufs(struct eth_driver *driver)
 
 static void raw_poll(struct eth_driver *driver)
 {
+    e1000_dev_t *dev = (e1000_dev_t *)driver->eth_data;
+    if (dev->need_rx_buffers) {
+        dev->need_rx_buffers = false;
+        fill_rx_bufs(driver);
+    }
     complete_rx(driver);
     complete_tx(driver);
     fill_rx_bufs(driver);
@@ -1009,8 +1017,8 @@ static int common_init(struct eth_driver *driver, ps_io_ops_t io_ops, void *conf
     int err;
     ethif_intel_config_t *eth_config = (ethif_intel_config_t *) config;
     dev->iobase = eth_config->bar0;
-    dev->tx_size = CONFIG_LIB_ETHDRIVER_RX_DESC_COUNT;
-    dev->rx_size = CONFIG_LIB_ETHDRIVER_TX_DESC_COUNT;
+    dev->tx_size = CONFIG_LIB_ETHDRIVER_TX_DESC_COUNT;
+    dev->rx_size = CONFIG_LIB_ETHDRIVER_RX_DESC_COUNT;
 
     /* technically we support alignemtn of 1, but get better performance with some alignment */
     driver->dma_alignment = 16;
